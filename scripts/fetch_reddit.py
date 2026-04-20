@@ -30,7 +30,7 @@ PAIN_SIGNALS = [
     "wastes time", "waste of time", "time sink", "soul crushing",
 ]
 
-USER_AGENT = "reddit-leads-scanner/0.1 by u/research_bot"
+USER_AGENT = "macos:smb-leads-scanner:v0.1 (by /u/humaiddb)"
 
 
 def fetch_subreddit(sub: str) -> list[dict]:
