@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Fetch recent posts from SMB subreddits and filter for automation pain signals.
-
-Outputs JSON to stdout. The ranker script consumes it.
+Fetch recent posts from SMB subreddits via pullpush.io (community Reddit archive)
+and filter for automation pain signals.
 """
 
 import json
@@ -10,13 +9,13 @@ import sys
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 SUBREDDITS = ["smallbusiness", "Entrepreneur", "EntrepreneurRideAlong"]
-LOOKBACK_HOURS = 26  # slight overlap so we don't miss posts near the 24h boundary
-POSTS_PER_SUB = 100  # reddit's /new.json max
+LOOKBACK_HOURS = 26
+POSTS_PER_SUB = 100
 
-# Broad pre-filter. The LLM does the nuanced ranking downstream.
 PAIN_SIGNALS = [
     "manually", "by hand", "copy paste", "copy and paste", "copy-paste",
     "spreadsheet", "excel sheet", "tedious", "repetitive", "takes forever",
@@ -30,14 +29,22 @@ PAIN_SIGNALS = [
     "wastes time", "waste of time", "time sink", "soul crushing",
 ]
 
-USER_AGENT = "macos:smb-leads-scanner:v0.1 (by /u/humaiddb)"
+USER_AGENT = "macos:smb-leads-scanner:v0.2 (by /u/humaiddb)"
 
 
-def fetch_subreddit(sub: str) -> list[dict]:
-    url = f"https://www.reddit.com/r/{sub}/new.json?limit={POSTS_PER_SUB}"
+def fetch_subreddit(sub):
+    cutoff_ts = int((datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)).timestamp())
+    params = urllib.parse.urlencode({
+        "subreddit": sub,
+        "after": cutoff_ts,
+        "size": POSTS_PER_SUB,
+        "sort": "desc",
+        "sort_type": "created_utc",
+    })
+    url = f"https://api.pullpush.io/reddit/search/submission/?{params}"
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=60) as resp:
             data = json.load(resp)
     except urllib.error.HTTPError as e:
         print(f"[warn] r/{sub}: HTTP {e.code}", file=sys.stderr)
@@ -45,36 +52,38 @@ def fetch_subreddit(sub: str) -> list[dict]:
     except Exception as e:
         print(f"[warn] r/{sub}: {e}", file=sys.stderr)
         return []
-    return [c["data"] for c in data.get("data", {}).get("children", [])]
+    return data.get("data", [])
 
 
-def matches_pain(text: str) -> list[str]:
+def matches_pain(text):
     t = text.lower()
     return [sig for sig in PAIN_SIGNALS if sig in t]
 
 
-def main() -> None:
-    cutoff_ts = (datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)).timestamp()
+def main():
     candidates = []
-
     for sub in SUBREDDITS:
         posts = fetch_subreddit(sub)
-        time.sleep(2)  # be polite to reddit
+        print(f"[info] r/{sub}: fetched {len(posts)} posts", file=sys.stderr)
+        time.sleep(2)
         for p in posts:
-            if p.get("created_utc", 0) < cutoff_ts:
-                continue
             if p.get("stickied") or p.get("over_18"):
                 continue
             title = p.get("title", "")
             body = p.get("selftext", "")
+            if body in ("[removed]", "[deleted]"):
+                body = ""
             signals = matches_pain(f"{title}\n{body}")
             if not signals:
                 continue
+            permalink = p.get("permalink", "")
+            if not permalink.startswith("/"):
+                permalink = f"/r/{sub}/comments/{p.get('id', '')}/"
             candidates.append({
                 "subreddit": sub,
                 "title": title,
-                "body": body[:2500],  # trim to keep token costs reasonable
-                "url": f"https://reddit.com{p.get('permalink', '')}",
+                "body": body[:2500],
+                "url": f"https://reddit.com{permalink}",
                 "author": p.get("author", ""),
                 "score": p.get("score", 0),
                 "num_comments": p.get("num_comments", 0),
