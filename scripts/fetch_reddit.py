@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
-"""
-Fetch recent posts from SMB subreddits via pullpush.io (community Reddit archive)
-and filter for automation pain signals.
-"""
+"""Fetch recent posts from SMB subreddits via Reddit's RSS feeds."""
 
 import json
 import sys
 import time
+import html
+import re
 import urllib.request
 import urllib.error
-import urllib.parse
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 
 SUBREDDITS = ["smallbusiness", "Entrepreneur", "EntrepreneurRideAlong"]
 LOOKBACK_HOURS = 26
-POSTS_PER_SUB = 100
 
 PAIN_SIGNALS = [
     "manually", "by hand", "copy paste", "copy and paste", "copy-paste",
@@ -29,30 +27,59 @@ PAIN_SIGNALS = [
     "wastes time", "waste of time", "time sink", "soul crushing",
 ]
 
-USER_AGENT = "macos:smb-leads-scanner:v0.2 (by /u/humaiddb)"
+USER_AGENT = "macos:smb-leads-scanner:v0.3 (by /u/humaiddb)"
+NS = {"atom": "http://www.w3.org/2005/Atom"}
 
 
 def fetch_subreddit(sub):
-    cutoff_ts = int((datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)).timestamp())
-    params = urllib.parse.urlencode({
-        "subreddit": sub,
-        "after": cutoff_ts,
-        "size": POSTS_PER_SUB,
-        "sort": "desc",
-        "sort_type": "created_utc",
-    })
-    url = f"https://api.pullpush.io/reddit/search/submission/?{params}"
+    url = f"https://www.reddit.com/r/{sub}/new/.rss?limit=100"
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.load(resp)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
     except urllib.error.HTTPError as e:
         print(f"[warn] r/{sub}: HTTP {e.code}", file=sys.stderr)
         return []
     except Exception as e:
         print(f"[warn] r/{sub}: {e}", file=sys.stderr)
         return []
-    return data.get("data", [])
+
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as e:
+        print(f"[warn] r/{sub}: XML parse error: {e}", file=sys.stderr)
+        return []
+
+    posts = []
+    for entry in root.findall("atom:entry", NS):
+        title_el = entry.find("atom:title", NS)
+        link_el = entry.find("atom:link", NS)
+        content_el = entry.find("atom:content", NS)
+        updated_el = entry.find("atom:updated", NS)
+        author_el = entry.find("atom:author/atom:name", NS)
+
+        title = title_el.text if title_el is not None else ""
+        link = link_el.get("href") if link_el is not None else ""
+        content_html = content_el.text if content_el is not None else ""
+        updated = updated_el.text if updated_el is not None else ""
+        author = author_el.text if author_el is not None else ""
+
+        content_text = re.sub(r"<[^>]+>", " ", html.unescape(content_html or ""))
+        content_text = re.sub(r"\s+", " ", content_text).strip()
+
+        try:
+            created_dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+        except ValueError:
+            created_dt = datetime.now(timezone.utc)
+
+        posts.append({
+            "title": title or "",
+            "url": link,
+            "author": author.replace("/u/", ""),
+            "body": content_text[:3000],
+            "created_dt": created_dt,
+        })
+    return posts
 
 
 def matches_pain(text):
@@ -61,37 +88,33 @@ def matches_pain(text):
 
 
 def main():
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
     candidates = []
+
     for sub in SUBREDDITS:
         posts = fetch_subreddit(sub)
         print(f"[info] r/{sub}: fetched {len(posts)} posts", file=sys.stderr)
         time.sleep(2)
+        recent = 0
         for p in posts:
-            if p.get("stickied") or p.get("over_18"):
+            if p["created_dt"] < cutoff:
                 continue
-            title = p.get("title", "")
-            body = p.get("selftext", "")
-            if body in ("[removed]", "[deleted]"):
-                body = ""
-            signals = matches_pain(f"{title}\n{body}")
+            recent += 1
+            signals = matches_pain(f"{p['title']}\n{p['body']}")
             if not signals:
                 continue
-            permalink = p.get("permalink", "")
-            if not permalink.startswith("/"):
-                permalink = f"/r/{sub}/comments/{p.get('id', '')}/"
             candidates.append({
                 "subreddit": sub,
-                "title": title,
-                "body": body[:2500],
-                "url": f"https://reddit.com{permalink}",
-                "author": p.get("author", ""),
-                "score": p.get("score", 0),
-                "num_comments": p.get("num_comments", 0),
-                "created_iso": datetime.fromtimestamp(
-                    p.get("created_utc", 0), tz=timezone.utc
-                ).isoformat(),
+                "title": p["title"],
+                "body": p["body"][:2500],
+                "url": p["url"],
+                "author": p["author"],
+                "score": 0,
+                "num_comments": 0,
+                "created_iso": p["created_dt"].isoformat(),
                 "matched_signals": signals,
             })
+        print(f"[info] r/{sub}: {recent} within {LOOKBACK_HOURS}h window", file=sys.stderr)
 
     print(f"[info] found {len(candidates)} candidate posts", file=sys.stderr)
     json.dump(candidates, sys.stdout, indent=2)
